@@ -1,7 +1,6 @@
 import os
 import subprocess
 import shutil  # Required for deleting directories
-import pydriller
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Get the current user's username and create a temporary folder in /tmp/
@@ -90,5 +89,4 @@ def parallel_clone_analyze_delete(urls, max_workers=4):
             print(future.result())
 
 # Set the number of workers (threads)
-# Too many workers will kill your machine (until OOM-killer kills the memory hogs)
 parallel_clone_analyze_delete(urls, max_workers=2)
