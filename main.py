@@ -30,10 +30,21 @@ def clone_repo(repo_name):
     if not os.path.exists(repo_dir):
         print(f"Cloning {repo_url} into {repo_dir}...")
         try:
-            subprocess.run(['git', 'clone', repo_url, repo_dir], check=True)
+            process = subprocess.Popen(['git', 'clone', repo_url, repo_dir],
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE,
+                                       universal_newlines=True,
+                                       encoding='utf-8')
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                print(f"Failed to clone {repo_url}: {stderr}")
+                return None
             return repo_dir
         except subprocess.CalledProcessError as e:
             print(f"Failed to clone {repo_url}: {e}")
+            return None
+        except UnicodeDecodeError as e:
+            print(f"Encoding error when cloning repository: {e}")
             return None
     else:
         print(f"Repository {repo_base_name} already cloned.")
@@ -68,16 +79,41 @@ def run_refactoringminer(repo_dir):
     json_output = f"{repo_name}_refactorings.json"
 
     if platform.system() == "Windows":
-        refactoringminer_cmd = 'RefactoringMiner.bat'
+        refactoringminer_cmd = os.path.join(os.path.dirname(__file__), 'RefactoringMiner.bat')
     else:
-        refactoringminer_cmd = './RefactoringMiner'
+        refactoringminer_cmd = os.path.join(os.path.dirname(__file__), 'RefactoringMiner')
+
+    # Check if RefactoringMiner executable exists
+    if not shutil.which(refactoringminer_cmd):
+        print(f"RefactoringMiner executable not found. Please ensure it's in your PATH or in the current directory.")
+        return None
 
     try:
         print(f"Running RefactoringMiner on {repo_dir}...")
-        subprocess.run([refactoringminer_cmd, '-a', repo_dir, '-json', json_output], check=True)
+        process = subprocess.Popen([refactoringminer_cmd, '-a', repo_dir, '-json', json_output],
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE,
+                                   universal_newlines=True,
+                                   encoding='utf-8')
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            print(f"RefactoringMiner failed with error: {stderr}")
+            return None
+
+        if not os.path.exists(json_output):
+            print(f"RefactoringMiner did not produce the expected output file: {json_output}")
+            return None
+
         return json_output
     except subprocess.CalledProcessError as e:
         print(f"Failed to analyze {repo_name} with RefactoringMiner: {e}")
+        return None
+    except FileNotFoundError:
+        print(f"RefactoringMiner executable not found. Please ensure it's in your PATH or in the current directory.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred while running RefactoringMiner: {e}")
         return None
 
 # Function to process RefactoringMiner output
@@ -122,22 +158,30 @@ def process_refactoring_miner_output(json_output):
 # Function to run git log
 def run_git_log(repo_dir):
     git_log_command = [
-        'git', '-C', repo_dir, 'log', '--numstat', '--pretty=format:\'%H,%an\''
+        'git', '-C', repo_dir, 'log', '--numstat', '--pretty=format:%H,%an'
     ]
     try:
         print(f"Running git log on {repo_dir}...")
 
         # Run the git log command and capture the output
-        git_log_output = subprocess.run(git_log_command, capture_output=True, text=True, check=True)
+        process = subprocess.Popen(git_log_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8')
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            print(f"Error running git log: {stderr}")
+            return []
 
         # Split the output by lines
-        git_log_data = git_log_output.stdout.splitlines()
+        git_log_data = stdout.splitlines()
 
         return git_log_data  # This will be a list of lines for processing
 
     except subprocess.CalledProcessError as e:
         print(f"Failed to retrieve git log for {repo_dir}: {e}")
         print(f"Error output: {e.stderr}")
+        return []
+    except UnicodeDecodeError as e:
+        print(f"Encoding error when reading git log output: {e}")
         return []
 
 # Function to collect TLOC for each developer and tie it to refactorings
@@ -150,8 +194,8 @@ def collect_developer_tloc(scc_data, git_log_data, refactorings):
     author = None
 
     for entry in git_log_data:
-        if entry.startswith("'"):
-            parts = entry.strip("'").split(",")
+        if ',' in entry:
+            parts = entry.split(",")
             commit_hash = parts[0]
             author = ",".join(parts[1:])
         else:
