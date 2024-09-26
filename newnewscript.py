@@ -10,7 +10,7 @@ from pydriller import Repository
 
 # GitHub API base URL and access token
 BASE_URL = "https://api.github.com"
-TOKEN = "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"
+TOKEN = "whoops forgot my token here lol"
 HEADERS = {"Authorization": f"token {TOKEN}"}
 
 
