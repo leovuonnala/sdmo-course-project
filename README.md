@@ -3,7 +3,7 @@ Course project for Software Development, Maintenance and Operations
 
 ## How to use it:
 Main.py is the repo downloader. It needs RefactoringMiner and scc to function. Main.py should be placed in the root of the project. RefactoringMiner's lib and bin folders should be placed in the same folder. SCC executable must be placed in bin. 
-
+INCREASE ulimit -n to 8192 or higher temporarily. Refactoringminer will fail on bigger repos without it on Linux. https://ss64.com/bash/ulimit.html
 1. Create a venv, install pydriller.
 2. Place urls.txt in the same folder as main.py
 3. Run python3 main.py
