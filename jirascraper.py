@@ -386,7 +386,7 @@ def main():
         os.makedirs('project_data', exist_ok=True)
 
         # Read URLs from file
-        with open('sorted_jira_urls.txt', 'r') as file:
+        with open('jira_urls.txt', 'r') as file:
             start_urls = [line.strip() for line in file if line.strip()]
 
         if not start_urls:
