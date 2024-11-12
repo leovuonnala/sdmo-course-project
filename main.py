@@ -1,12 +1,13 @@
 import os
 import subprocess
 import json
-import requests
-import time
+#import requests if python complains, remove comment and install requests
+#import time
 import shutil
 from pydriller import Repository
 import concurrent.futures
 import threading
+from urllib.parse import urlparse, urlunparse
 
 # Set of programming languages to consider
 PROGRAMMING_LANGUAGES = {
@@ -41,15 +42,43 @@ PROGRAMMING_LANGUAGES = {
     "yacc", "Yorick", "Z shell", "Zig"
 }
 
+def create_authenticated_url(url, token):
+    """Convert a regular GitHub URL to an authenticated URL with token."""
+    parsed = urlparse(url)
+    if parsed.hostname and 'github.com' in parsed.hostname:
+        netloc = f'{token}@{parsed.hostname}'
+        return urlunparse(parsed._replace(netloc=netloc))
+    return url
+
 def read_urls(file_path):
     with open(file_path, 'r') as file:
         return [line.strip() for line in file if line.strip()]
 
-def clone_repo(url, target_dir):
+def clone_repo(url, target_dir, token):
+    """Clone repository with authentication token."""
     repo_name = url.split('/')[-1]
     target_path = os.path.join(target_dir, repo_name)
+
     if not os.path.exists(target_path):
-        subprocess.run(['git', 'clone', url, target_path], check=True)
+        authenticated_url = create_authenticated_url(url, token)
+
+        # Set up Git configuration for the process
+        env = os.environ.copy()
+        env['GIT_TERMINAL_PROMPT'] = '0'  # Disable Git credential prompt
+
+        try:
+            subprocess.run(
+                ['git', 'clone', authenticated_url, target_path],
+                check=True,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE  # Capture stderr to avoid exposing token in logs
+            )
+        except subprocess.CalledProcessError as e:
+            # Clean up error message to avoid exposing token
+            error_msg = str(e.stderr.decode()).replace(token, '***')
+            raise Exception(f"Failed to clone repository: {error_msg}")
+
     return target_path, repo_name
 
 def run_refactoring_miner(repo_path, output_file):
@@ -90,18 +119,87 @@ def analyze_diffs(repo_path, refactorings_file):
 
     return output_data
 
+def safe_git_checkout(repo_path, commit_hash):
+    """
+    Safely checkout a specific commit, handling detached HEAD states.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # First, try to fetch the commit if it's not available
+        subprocess.run(
+            ['git', 'fetch', '--all', '--prune'],
+            cwd=repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        # Clean any untracked files and reset any changes
+        subprocess.run(
+            ['git', 'clean', '-fd'],
+            cwd=repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        subprocess.run(
+            ['git', 'reset', '--hard'],
+            cwd=repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        # Now try to checkout the commit
+        subprocess.run(
+            ['git', 'checkout', '-f', commit_hash],
+            cwd=repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
 def get_main_branch(repo_path):
+    """Modified to be more robust"""
+    try:
+        # First try to get the default branch from remote
+        result = subprocess.run(
+            ['git', 'remote', 'show', 'origin'],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+
+        for line in result.stdout.split('\n'):
+            if 'HEAD branch:' in line:
+                default_branch = line.split(':')[1].strip()
+                if safe_git_checkout(repo_path, default_branch):
+                    return default_branch
+    except subprocess.CalledProcessError:
+        pass
+
+    # Fallback to checking main/master
     for branch in ['main', 'master']:
-        try:
-            subprocess.run(['git', 'checkout', branch], cwd=repo_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if safe_git_checkout(repo_path, branch):
             return branch
-        except subprocess.CalledProcessError:
-            continue
-    raise Exception("Neither 'main' nor 'master' branch found")
+
+    raise Exception("Could not determine or checkout main branch")
 
 def get_loc(repo_path, commit_hash):
-    subprocess.run(['git', 'checkout', commit_hash], cwd=repo_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    scc_output = subprocess.check_output([os.path.join('bin', 'scc'), '-f', 'json', repo_path], universal_newlines=True)
+    """Modified to use safe checkout"""
+    if not safe_git_checkout(repo_path, commit_hash):
+        # If checkout fails, return 0 or raise an exception based on your needs
+        return 0
+
+    scc_output = subprocess.check_output(
+        [os.path.join('bin', 'scc'), '-f', 'json', repo_path],
+        universal_newlines=True
+    )
     scc_data = json.loads(scc_output)
 
     total_loc = 0
@@ -118,31 +216,50 @@ def analyze_developer_effort(repo_path, refactorings_file):
 
     effort_data = []
 
-    for commit_info in refactorings_data['commits']:
-        commit_hash = commit_info['sha1']
+    try:
+        for commit_info in refactorings_data['commits']:
+            commit_hash = commit_info['sha1']
 
-        repo = Repository(repo_path, single=commit_hash)
-        for commit in repo.traverse_commits():
-            previous_commit_hash = commit.parents[0]
-            developer = commit.author.name
+            repo = Repository(repo_path, single=commit_hash)
+            for commit in repo.traverse_commits():
+                try:
+                    previous_commit_hash = commit.parents[0]
+                    developer = commit.author.name
 
-            loc_before = get_loc(repo_path, previous_commit_hash)
-            loc_after = get_loc(repo_path, commit_hash)
-            tloc = abs(loc_after - loc_before)
+                    # Use safe checkout for both commits
+                    if not safe_git_checkout(repo_path, previous_commit_hash):
+                        safe_print(f"Warning: Could not checkout {previous_commit_hash}, skipping...")
+                        continue
 
-            effort_data.append({
-                'commit_hash': commit_hash,
-                'previous_commit_hash': previous_commit_hash,
-                'developer': developer,
-                'loc_before': loc_before,
-                'loc_after': loc_after,
-                'tloc': tloc
-            })
+                    loc_before = get_loc(repo_path, previous_commit_hash)
 
-            break  # We only need to process the single commit
+                    if not safe_git_checkout(repo_path, commit_hash):
+                        safe_print(f"Warning: Could not checkout {commit_hash}, skipping...")
+                        continue
 
-    main_branch = get_main_branch(repo_path)
-    subprocess.run(['git', 'checkout', main_branch], cwd=repo_path, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    loc_after = get_loc(repo_path, commit_hash)
+                    tloc = abs(loc_after - loc_before)
+
+                    effort_data.append({
+                        'commit_hash': commit_hash,
+                        'previous_commit_hash': previous_commit_hash,
+                        'developer': developer,
+                        'loc_before': loc_before,
+                        'loc_after': loc_after,
+                        'tloc': tloc
+                    })
+                except Exception as e:
+                    safe_print(f"Warning: Error processing commit {commit_hash}: {str(e)}")
+                break  # We only need to process the single commit
+    except Exception as e:
+        safe_print(f"Warning: Error in analyze_developer_effort: {str(e)}")
+
+    try:
+        # Try to return to main branch, but don't fail if we can't
+        main_branch = get_main_branch(repo_path)
+        safe_git_checkout(repo_path, main_branch)
+    except Exception:
+        pass
 
     return effort_data
 
@@ -152,12 +269,11 @@ def safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
 
-def process_repository(url, repos_dir, results_dir):
+def process_repository(url, repos_dir, results_dir, token):
     repo_path = None
     try:
-        repo_path, repo_name = clone_repo(url, repos_dir)
+        repo_path, repo_name = clone_repo(url, repos_dir, token)
 
-        # Get the main branch right after cloning
         main_branch = get_main_branch(repo_path)
 
         repo_results_dir = os.path.join(results_dir, repo_name)
@@ -184,7 +300,6 @@ def process_repository(url, repos_dir, results_dir):
     except Exception as e:
         safe_print(f"Unexpected error processing {url}: {e}")
     finally:
-        # Ensure the repository folder is deleted even if an error occurs
         if repo_path and os.path.exists(repo_path):
             shutil.rmtree(repo_path)
             safe_print(f"Cleaned up repository folder for {url}")
@@ -194,16 +309,23 @@ def main():
     repos_dir = 'repos'
     results_dir = 'results'
 
+    # Get token from environment variable for security
+    token = os.getenv('GITHUB_TOKEN')
+    if not token:
+        raise ValueError("GITHUB_TOKEN environment variable not set")
+
     os.makedirs(repos_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
     urls = read_urls(urls_file)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        futures = [executor.submit(process_repository, url, repos_dir, results_dir) for url in urls]
+        futures = [
+            executor.submit(process_repository, url, repos_dir, results_dir, token)
+            for url in urls
+        ]
         concurrent.futures.wait(futures)
 
-    # Clean up the repos directory after all processing is complete
     if os.path.exists(repos_dir):
         shutil.rmtree(repos_dir)
         safe_print(f"Cleaned up {repos_dir} directory.")
